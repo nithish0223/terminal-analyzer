@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Terminal Incident Analyzer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #080c12; font-family: 'Courier New', Courier, monospace; color: #b8ccd8; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #0a0f1a; } ::-webkit-scrollbar-thumb { background: #1a2a3a; }
+  .go-btn:hover:not(:disabled) { background: #243e22 !important; }
+  .q-btn:hover { color: #7eb8e0 !important; }
+  .hist-row:hover { background: #0f1820 !important; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+  .blink { animation: blink 1.2s infinite; }
+  @keyframes growBar { from { width: 0; } }
+  .bar { animation: growBar 0.8s ease; }
+  textarea:focus, input:focus { border-color: #2a4a68 !important; outline: none; }
+  @media (max-width: 700px) {
+    .body-layout { flex-direction: column !important; }
+    .left-panel { width: 100% !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState } = React;
+
+const QUICK_EVENTS = [
+  "Crane offline at berth 3",
+  "Container not found in yard",
+  "Vessel ETA delayed by 8 hours",
+  "Gate OCR system down",
+  "TOS not responding",
+  "Reefer temperature alarm on 12 containers",
+  "Straddle carrier breakdown in yard",
+  "Berth conflict — 2 vessels same window",
+];
+
+const SYSTEM_PROMPT = `You are a maritime terminal operations analyst. Respond ONLY with raw JSON. No markdown, no backticks, no explanation. Just the JSON object.
+
+Use this exact structure:
+{
+  "title": "short title",
+  "category": "Equipment",
+  "severity": "critical",
+  "eventSummary": "plain English summary of the incident",
+  "operationImpact": {
+    "summary": "what is physically happening in the terminal right now",
+    "affectedAreas": ["Quay", "Yard"],
+    "cascadeRisks": ["risk if not resolved 1", "risk 2"]
+  },
+  "troubleshootingSteps": [
+    { "step": 1, "action": "action description", "who": "Shift Supervisor", "urgency": "now" },
+    { "step": 2, "action": "action description", "who": "Equipment Manager", "urgency": "15min" },
+    { "step": 3, "action": "action description", "who": "Port Ops", "urgency": "15min" },
+    { "step": 4, "action": "action description", "who": "Planning Team", "urgency": "1hr" }
+  ],
+  "financialImpact": {
+    "hourlyBurnRate": 15000,
+    "estimatedResolutionHours": 3,
+    "totalExposure": 45000,
+    "breakdown": [
+      { "item": "Vessel idle time", "amountPerHour": 10000, "note": "shipping line penalty" },
+      { "item": "Labor standby", "amountPerHour": 3000, "note": "crane crew on hold" },
+      { "item": "Truck demurrage", "amountPerHour": 2000, "note": "queued trucks at gate" }
+    ],
+    "additionalExposures": ["Penalty clauses in vessel contract", "Cargo delay claims"],
+    "financeAlert": "One sentence for the CFO summarizing total exposure and key cost driver."
+  },
+  "escalationPath": [
+    "Notify Terminal Manager immediately",
+    "Alert shipping line ops within 30 minutes",
+    "Update port authority if delay exceeds 4 hours"
+  ],
+  "glossary": [
+    { "term": "Demurrage", "plain": "Fee charged when cargo or vessel stays longer than agreed free time" },
+    { "term": "Berth", "plain": "The docking slot where a ship ties up at the terminal" }
+  ]
+}`;
+
+function extractJSON(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw.trim()); } catch {}
+  const stripped = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+  try { return JSON.parse(stripped); } catch {}
+  const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+  if (s !== -1 && e !== -1) {
+    try { return JSON.parse(raw.slice(s, e + 1)); } catch {}
+  }
+  return null;
+}
+
+function App() {
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("maritime_api_key") || "");
+  const [showKeyInput, setShowKeyInput] = useState(!localStorage.getItem("maritime_api_key"));
+  const [input, setInput] = useState("");
+  const [duration, setDuration] = useState("2");
+  const [view, setView] = useState("ops");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [history, setHistory] = useState([]);
+
+  const saveKey = () => {
+    localStorage.setItem("maritime_api_key", apiKey);
+    setShowKeyInput(false);
+  };
+
+  const analyze = async (overrideText) => {
+    const incident = overrideText || input;
+    if (!incident.trim()) return;
+    if (!apiKey) { setShowKeyInput(true); return; }
+    setLoading(true);
+    setError(null);
+    setResult(null);
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 4000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: `Incident: ${incident}\nDuration: ${duration} hours. Return only the JSON.` }]
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setError(`API Error ${res.status}: ${data?.error?.message || JSON.stringify(data)}`);
+        setLoading(false);
+        return;
+      }
+
+      const raw = (data.content || []).map(b => b.text || "").join("");
+      const parsed = extractJSON(raw);
+      if (!parsed) {
+        setError(`Could not parse response.\n\n${raw.slice(0, 400)}`);
+        setLoading(false);
+        return;
+      }
+      setResult(parsed);
+      setHistory(h => [{ incident, result: parsed }, ...h.slice(0, 4)]);
+    } catch (e) {
+      setError(`Error: ${e.message}`);
+    }
+    setLoading(false);
+  };
+
+  const sc = { critical: "#ff3b3b", high: "#ff8c00", medium: "#f5c518", low: "#4fc3f7" };
+  const sb = { critical: "rgba(255,59,59,0.1)", high: "rgba(255,140,0,0.1)", medium: "rgba(245,197,24,0.08)", low: "rgba(79,195,247,0.08)" };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+
+      {/* Header */}
+      <div style={{ background: "#0a0f1a", borderBottom: "1px solid #1a2a3a", padding: "14px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 24, color: "#ff8c00" }}>⚠</span>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: "bold", letterSpacing: "0.15em", color: "#e8b84b" }}>TERMINAL INCIDENT ANALYZER</div>
+            <div style={{ fontSize: 10, color: "#3a5a78", letterSpacing: "0.1em" }}>Ops Triage · Finance Impact · AI-Powered</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {result && (
+            <div style={{ display: "flex", gap: 2 }}>
+              {["ops","finance"].map(v => (
+                <button key={v} onClick={() => setView(v)}
+                  style={{ background: view===v ? "#1a2e18" : "transparent", border: `1px solid ${view===v ? "#2a6a30" : "#1a2a3a"}`, color: view===v ? "#4ecb60" : "#3a5a78", padding: "5px 12px", cursor: "pointer", fontFamily: "inherit", fontSize: 10, letterSpacing: "0.08em" }}>
+                  {v === "ops" ? "OPS VIEW" : "FINANCE VIEW"}
+                </button>
+              ))}
+            </div>
+          )}
+          <button onClick={() => setShowKeyInput(!showKeyInput)}
+            style={{ background: "transparent", border: "1px solid #1a2a3a", color: "#3a5a78", padding: "5px 12px", cursor: "pointer", fontFamily: "inherit", fontSize: 10 }}>
+            {apiKey ? "🔑 KEY SET" : "🔑 SET API KEY"}
+          </button>
+        </div>
+      </div>
+
+      {/* API Key input */}
+      {showKeyInput && (
+        <div style={{ background: "#0c1520", borderBottom: "1px solid #1a3a50", padding: "14px 24px", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11, color: "#4a7898" }}>Anthropic API Key:</span>
+          <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
+            placeholder="sk-ant-..."
+            style={{ flex: 1, minWidth: 200, background: "#080c12", border: "1px solid #1a2a3a", color: "#b8ccd8", padding: "6px 10px", fontFamily: "inherit", fontSize: 12, borderRadius: 2 }} />
+          <button onClick={saveKey}
+            style={{ background: "#1a2e18", border: "1px solid #2a6a30", color: "#4ecb60", padding: "6px 16px", cursor: "pointer", fontFamily: "inherit", fontSize: 11, borderRadius: 2 }}>
+            Save
+          </button>
+          <span style={{ fontSize: 10, color: "#2a4a68" }}>Saved in your browser. Get a key at console.anthropic.com</span>
+        </div>
+      )}
+
+      {/* Body */}
+      <div className="body-layout" style={{ display: "flex", flex: 1, padding: "16px 20px", gap: 14, maxWidth: 1100, margin: "0 auto", width: "100%" }}>
+
+        {/* Left */}
+        <div className="left-panel" style={{ width: 260, flexShrink: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ background: "#0c121c", border: "1px solid #1a2a3a", borderRadius: 3, padding: 14 }}>
+            <div style={{ fontSize: 10, color: "#3a5a78", letterSpacing: "0.12em", marginBottom: 10 }}>REPORT INCIDENT</div>
+            <textarea value={input} onChange={e => setInput(e.target.value)} rows={4}
+              placeholder={"Describe what's happening...\ne.g. Crane 4 offline, vessel waiting at berth 7"}
+              style={{ width: "100%", background: "#080c12", border: "1px solid #1a2a3a", color: "#b8ccd8", padding: "8px 10px", fontFamily: "inherit", fontSize: 12, borderRadius: 2, resize: "none", lineHeight: 1.6 }} />
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 10, color: "#3a5a78", marginBottom: 6 }}>Duration so far</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {["0.5","1","2","4","8","12"].map(h => (
+                  <button key={h} onClick={() => setDuration(h)}
+                    style={{ background: duration===h ? "#1a2a3a" : "transparent", border: `1px solid ${duration===h ? "#2a4a68" : "#1a2a3a"}`, color: duration===h ? "#7eb8e0" : "#3a5a78", padding: "3px 8px", cursor: "pointer", fontFamily: "inherit", fontSize: 11, borderRadius: 2 }}>
+                    {h}h
+                  </button>
+                ))}
+              </div>
+            </div>
+            <button onClick={() => analyze()} disabled={loading} className="go-btn"
+              style={{ marginTop: 10, width: "100%", background: "#1a2e18", border: "1px solid #2a6a30", color: "#4ecb60", padding: 9, cursor: "pointer", fontFamily: "inherit", fontSize: 12, letterSpacing: "0.1em", borderRadius: 2, opacity: loading ? 0.6 : 1 }}>
+              {loading ? <span className="blink">ANALYZING...</span> : "▶  ANALYZE INCIDENT"}
+            </button>
+            <div style={{ borderTop: "1px solid #1a2a3a", margin: "12px 0" }} />
+            <div style={{ fontSize: 10, color: "#3a5a78", letterSpacing: "0.12em", marginBottom: 8 }}>QUICK EVENTS</div>
+            {QUICK_EVENTS.map((e, i) => (
+              <button key={i} className="q-btn" onClick={() => { setInput(e); analyze(e); }}
+                style={{ display: "block", width: "100%", background: "transparent", border: "none", color: "#3a5a78", padding: "5px 0", cursor: "pointer", fontFamily: "inherit", fontSize: 11, textAlign: "left", borderBottom: "1px solid #0d1520" }}>
+                {e}
+              </button>
+            ))}
+          </div>
+
+          {history.length > 0 && (
+            <div style={{ background: "#0c121c", border: "1px solid #1a2a3a", borderRadius: 3, padding: 14 }}>
+              <div style={{ fontSize: 10, color: "#3a5a78", letterSpacing: "0.12em", marginBottom: 10 }}>RECENT</div>
+              {history.map((h, i) => (
+                <div key={i} className="hist-row" onClick={() => { setResult(h.result); setError(null); }}
+                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", cursor: "pointer", borderBottom: "1px solid #0d1520" }}>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: sc[h.result.severity], flexShrink: 0, display: "inline-block" }} />
+                  <span style={{ fontSize: 11, color: "#3a5a78" }}>{h.incident.slice(0,36)}{h.incident.length>36?"…":""}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Right */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {!result && !loading && !error && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 360 }}>
+              <div style={{ fontSize: 42, opacity: 0.12 }}>⚓</div>
+              <div style={{ fontSize: 12, color: "#2a4a68", letterSpacing: "0.15em", marginTop: 12 }}>AWAITING INCIDENT</div>
+              <div style={{ fontSize: 11, color: "#1a2a3a", marginTop: 8, textAlign: "center", maxWidth: 280, lineHeight: 1.7 }}>
+                Describe an event or pick from Quick Events to get instant ops triage and financial impact.
+              </div>
+            </div>
+          )}
+
+          {loading && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 360 }}>
+              <div className="spin" style={{ width: 36, height: 36, border: "2px solid #1a2a3a", borderTop: "2px solid #4ecb60", borderRadius: "50%" }} />
+              <div style={{ fontSize: 12, color: "#2a6a30", letterSpacing: "0.12em", marginTop: 14 }}>ANALYZING...</div>
+            </div>
+          )}
+
+          {error && !loading && (
+            <div style={{ background: "rgba(255,59,59,0.07)", border: "1px solid rgba(255,59,59,0.2)", borderRadius: 3, padding: 18 }}>
+              <div style={{ color: "#ff6b6b", fontSize: 13, marginBottom: 12 }}>⚠ Analysis failed</div>
+              <pre style={{ fontSize: 11, color: "#8a4040", background: "#0a0505", border: "1px solid #2a1010", borderRadius: 2, padding: 12, whiteSpace: "pre-wrap", wordBreak: "break-all", lineHeight: 1.6 }}>{error}</pre>
+            </div>
+          )}
+
+          {result && !loading && (() => {
+            const fi = result.financialImpact || {};
+            const oi = result.operationImpact || {};
+            const card = { background: "#0c121c", border: "1px solid #1a2a3a", borderRadius: 3, padding: "14px 18px", marginBottom: 10 };
+            const cardLabel = { fontSize: 10, color: "#3a5a78", letterSpacing: "0.12em", marginBottom: 12 };
+            return (
+              <div>
+                {/* Title */}
+                <div style={{ ...card, borderLeft: `3px solid ${sc[result.severity]||"#888"}` }}>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 10, padding: "2px 10px", borderRadius: 2, fontWeight: "bold", letterSpacing: "0.08em", background: sb[result.severity], color: sc[result.severity] }}>● {(result.severity||"").toUpperCase()}</span>
+                    <span style={{ fontSize: 10, color: "#3a5a78", border: "1px solid #1a2a3a", padding: "2px 10px", borderRadius: 2 }}>{result.category}</span>
+                  </div>
+                  <div style={{ fontSize: 15, color: "#e8c870", fontWeight: "bold", marginBottom: 6 }}>{result.title}</div>
+                  <div style={{ fontSize: 12, color: "#7a9ab8", lineHeight: 1.7 }}>{result.eventSummary}</div>
+                </div>
+
+                {/* Finance banner */}
+                <div style={{ ...card, background: "linear-gradient(135deg,#0f1e10,#0a1814)", border: "1px solid #1a3a20", display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontSize: 10, color: "#2a6a30", letterSpacing: "0.12em", marginBottom: 4 }}>TOTAL EXPOSURE</div>
+                    <div style={{ fontSize: 26, color: "#4ecb60", fontWeight: "bold" }}>${(fi.totalExposure||0).toLocaleString()}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 20, marginLeft: "auto" }}>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 10, color: "#2a4a38", marginBottom: 3 }}>BURN RATE</div>
+                      <div style={{ fontSize: 13, color: "#3aab50" }}>${(fi.hourlyBurnRate||0).toLocaleString()}/hr</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 10, color: "#2a4a38", marginBottom: 3 }}>EST. HOURS</div>
+                      <div style={{ fontSize: 13, color: "#3aab50" }}>{fi.estimatedResolutionHours||"—"}h</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* OPS */}
+                {view === "ops" && <>
+                  <div style={card}>
+                    <div style={cardLabel}>🔧 OPERATIONAL IMPACT</div>
+                    <div style={{ fontSize: 13, color: "#a8c0d0", lineHeight: 1.7, marginBottom: 10 }}>{oi.summary}</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                      {(oi.affectedAreas||[]).map((a,i)=><span key={i} style={{ fontSize: 10, background: "#0f1e30", border: "1px solid #1a3050", color: "#4a7898", padding: "3px 10px", borderRadius: 2 }}>{a}</span>)}
+                    </div>
+                    {(oi.cascadeRisks||[]).length > 0 && (
+                      <div style={{ background: "#140e0e", border: "1px solid #2a1a1a", borderRadius: 2, padding: "10px 14px" }}>
+                        <div style={{ fontSize: 10, color: "#6a2020", marginBottom: 8 }}>⚡ If not resolved</div>
+                        {oi.cascadeRisks.map((r,i)=><div key={i} style={{ fontSize: 12, color: "#a06050", marginBottom: 4 }}>→ {r}</div>)}
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={card}>
+                    <div style={cardLabel}>🛠 TROUBLESHOOTING STEPS</div>
+                    {(result.troubleshootingSteps||[]).map((s,i)=>{
+                      const uc = s.urgency==="now"?"#ff3b3b":s.urgency==="15min"?"#ff8c00":"#4fc3f7";
+                      return (
+                        <div key={i} style={{ display: "flex", gap: 12, marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid #0f1820" }}>
+                          <div style={{ width: 22, height: 22, background: "#1a2a3a", color: "#4a7898", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: "bold", borderRadius: 2, flexShrink: 0 }}>{s.step}</div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, color: "#a8c0d0", lineHeight: 1.6, marginBottom: 5 }}>{s.action}</div>
+                            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                              <span style={{ fontSize: 11, color: "#3a5a78" }}>👤 {s.who}</span>
+                              <span style={{ fontSize: 10, border: `1px solid ${uc}`, color: uc, padding: "1px 7px", borderRadius: 2 }}>
+                                {s.urgency==="now"?"⚡ NOW":s.urgency==="15min"?"◷ 15 MIN":"○ 1 HR"}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div style={card}>
+                    <div style={cardLabel}>📢 ESCALATION</div>
+                    {(result.escalationPath||[]).map((e,i)=>(
+                      <div key={i} style={{ display: "flex", gap: 10, fontSize: 12, color: "#7a9ab8", marginBottom: 8, lineHeight: 1.6 }}>
+                        <span style={{ background: "#1a2a3a", color: "#4a7898", fontSize: 10, width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%", flexShrink: 0 }}>{i+1}</span>
+                        {e}
+                      </div>
+                    ))}
+                  </div>
+
+                  {(result.glossary||[]).length > 0 && (
+                    <div style={card}>
+                      <div style={cardLabel}>📖 GLOSSARY</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px,1fr))", gap: 8 }}>
+                        {result.glossary.map((g,i)=>(
+                          <div key={i} style={{ background: "#080c12", border: "1px solid #1a2a3a", borderRadius: 2, padding: "10px 12px" }}>
+                            <div style={{ fontSize: 11, color: "#e8c870", marginBottom: 4 }}>{g.term}</div>
+                            <div style={{ fontSize: 11, color: "#4a6a88", lineHeight: 1.5 }}>{g.plain}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>}
+
+                {/* FINANCE */}
+                {view === "finance" && <>
+                  <div style={card}>
+                    <div style={cardLabel}>💰 COST BREAKDOWN</div>
+                    {(fi.breakdown||[]).map((b,i)=>(
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #0f1820", gap: 10 }}>
+                        <div>
+                          <div style={{ fontSize: 13, color: "#a8c0d0", marginBottom: 3 }}>{b.item}</div>
+                          <div style={{ fontSize: 11, color: "#2a4a68" }}>{b.note}</div>
+                        </div>
+                        <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ fontSize: 13, color: "#4ecb60" }}>${(b.amountPerHour||0).toLocaleString()}/hr</div>
+                          <div style={{ fontSize: 11, color: "#2a6a30", marginTop: 2 }}>${((b.amountPerHour||0)*(fi.estimatedResolutionHours||1)).toLocaleString()} est.</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={card}>
+                    <div style={cardLabel}>⚠ ADDITIONAL EXPOSURES</div>
+                    {(fi.additionalExposures||[]).map((e,i)=>(
+                      <div key={i} style={{ fontSize: 12, color: "#a06050", padding: "6px 0", borderBottom: "1px solid #0f1820" }}>⚠ {e}</div>
+                    ))}
+                  </div>
+
+                  <div style={{ ...card, background: "#100e08", border: "1px solid #3a3010" }}>
+                    <div style={{ fontSize: 10, color: "#6a5820", letterSpacing: "0.12em", marginBottom: 8 }}>FINANCE ALERT</div>
+                    <div style={{ fontSize: 13, color: "#d4a830", lineHeight: 1.7 }}>{fi.financeAlert}</div>
+                  </div>
+
+                  <div style={card}>
+                    <div style={cardLabel}>📊 COST SHARE</div>
+                    {(fi.breakdown||[]).map((b,i)=>{
+                      const pct = fi.hourlyBurnRate ? Math.round((b.amountPerHour/fi.hourlyBurnRate)*100) : 0;
+                      return (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                          <div style={{ fontSize: 11, color: "#3a5a78", width: 140, flexShrink: 0 }}>{b.item}</div>
+                          <div style={{ flex: 1, background: "#0f1820", borderRadius: 2, height: 8, overflow: "hidden" }}>
+                            <div className="bar" style={{ width: `${pct}%`, height: "100%", background: "linear-gradient(90deg,#1a5030,#4ecb60)", borderRadius: 2 }} />
+                          </div>
+                          <div style={{ fontSize: 11, color: "#2a6a30", width: 30, textAlign: "right" }}>{pct}%</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>}
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
